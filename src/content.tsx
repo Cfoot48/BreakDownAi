@@ -7,6 +7,7 @@ interface VideoInfo {
   description: string | null;
   channel: string | null;
   url: string;
+  duration: string | null;
 }
 
 interface AnalysisButtonProps {
@@ -18,6 +19,9 @@ const AnalysisOverlay: React.FC = () => {
   const [showModal, setShowModal] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Chat state
+  const [chatHistory, setChatHistory] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [userInput, setUserInput] = useState('');
   // Draggable modal state
   const [modalPos, setModalPos] = useState<{ x: number; y: number } | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -32,11 +36,25 @@ const AnalysisOverlay: React.FC = () => {
     const videoTitle = document.querySelector('h1.ytd-video-primary-info-renderer')?.textContent?.trim() || null;
     const videoDescription = document.querySelector('#description-inline-expander')?.textContent?.trim() || null;
     const channelName = document.querySelector('#channel-name a')?.textContent?.trim() || null;
+    // Extract video duration from the <video> element
+    const videoElem = document.querySelector('video');
+    let duration: string | null = null;
+    if (videoElem && !isNaN(videoElem.duration)) {
+      const totalSeconds = Math.floor(videoElem.duration);
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+      duration =
+        hours > 0
+          ? `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+          : `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
     return {
       title: videoTitle,
       description: videoDescription,
       channel: channelName,
-      url: window.location.href
+      url: window.location.href,
+      duration,
     };
   };
 
@@ -45,8 +63,9 @@ const AnalysisOverlay: React.FC = () => {
     setIsAnalyzing(true);
     setResult(null);
     setError(null);
+    setChatHistory([]);
+    setUserInput('');
     const videoInfo = extractVideoInfo();
-    // Get OpenAI API key from background script
     chrome.runtime.sendMessage({ type: 'GET_API_KEY' }, async (response) => {
       const apiKey = response?.apiKey;
       if (!apiKey) {
@@ -55,24 +74,11 @@ const AnalysisOverlay: React.FC = () => {
         return;
       }
       try {
-        // Compose the prompt
-        const prompt = `You are an expert at summarizing YouTube videos. Given the following video information, provide a comprehensive breakdown covering the ENTIRE video duration with estimated timestamps for important moments, key points, and a detailed summary.
-
-IMPORTANT: Provide timestamps and explanations for the FULL video duration, not just the beginning. Since you don't have access to the actual video content, estimate timestamps based on the description and typical video structure.
-
-Title: ${videoInfo.title}
-Description: ${videoInfo.description}
-Channel: ${videoInfo.channel}
-URL: ${videoInfo.url}
-
-Format your response as a detailed list with estimated timestamps and explanations covering the entire video. Include:
-- Introduction and setup (0:00 - ~2:00)
-- Main content sections with timestamps
-- Key points and highlights throughout
-- Conclusion and takeaways
-
-Make sure to cover the complete video duration, not just the first portion.`;
-        // Call OpenRouter API (which provides access to OpenAI models)
+        const prompt = `You are an expert at summarizing YouTube videos. Given the following video information, provide a comprehensive breakdown covering the ENTIRE video duration with estimated timestamps for important moments, key points, and a detailed summary.\n\nIMPORTANT: Provide timestamps and explanations for the FULL video duration, not just the beginning. Since you don't have access to the actual video content, estimate timestamps based on the description and typical video structure.\n\nTitle: ${videoInfo.title}\nDescription: ${videoInfo.description}\nChannel: ${videoInfo.channel}\nURL: ${videoInfo.url}\nDuration: ${videoInfo.duration || 'Unknown'}\n\nFormat your response as a detailed list with estimated timestamps and explanations covering the entire video. Include:\n- Introduction and setup (0:00 - ~2:00)\n- Main content sections with timestamps\n- Key points and highlights throughout\n- Conclusion and takeaways\n\nMake sure to cover the complete video duration, not just the first portion.`;
+        const messages = [
+          { role: 'system', content: 'You are a helpful assistant that provides comprehensive YouTube video summaries with estimated timestamps covering the ENTIRE video duration, not just the beginning portions.' },
+          { role: 'user', content: prompt }
+        ];
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
           method: 'POST',
           headers: {
@@ -83,11 +89,8 @@ Make sure to cover the complete video duration, not just the first portion.`;
           },
           body: JSON.stringify({
             model: 'openai/gpt-3.5-turbo',
-            messages: [
-              { role: 'system', content: 'You are a helpful assistant that provides comprehensive YouTube video summaries with estimated timestamps covering the ENTIRE video duration, not just the beginning portions.' },
-              { role: 'user', content: prompt }
-            ],
-            max_tokens: 1200,
+            messages,
+            max_tokens: 2048,
             temperature: 0.6
           })
         });
@@ -98,6 +101,62 @@ Make sure to cover the complete video duration, not just the first portion.`;
         const aiText = data.choices?.[0]?.message?.content || 'No response from AI.';
         setIsAnalyzing(false);
         setResult(aiText);
+        setChatHistory([
+          { role: 'assistant', content: aiText }
+        ]);
+      } catch (err: any) {
+        setIsAnalyzing(false);
+        setError('Failed to get analysis from OpenAI. ' + (err?.message || ''));
+      }
+    });
+  };
+
+  // Handle user follow-up question
+  const handleSendFollowup = async () => {
+    if (!userInput.trim()) return;
+    setIsAnalyzing(true);
+    setError(null);
+    const videoInfo = extractVideoInfo();
+    const newHistory = [
+      // Always start with the system and original prompt
+      { role: 'system', content: 'You are a helpful assistant that provides comprehensive YouTube video summaries with estimated timestamps covering the ENTIRE video duration, not just the beginning portions.' },
+      { role: 'user', content: `You are an expert at summarizing YouTube videos. Given the following video information, provide a comprehensive breakdown covering the ENTIRE video duration with estimated timestamps for important moments, key points, and a detailed summary.\n\nIMPORTANT: Provide timestamps and explanations for the FULL video duration, not just the beginning. Since you don't have access to the actual video content, estimate timestamps based on the description and typical video structure.\n\nTitle: ${videoInfo.title}\nDescription: ${videoInfo.description}\nChannel: ${videoInfo.channel}\nURL: ${videoInfo.url}\nDuration: ${videoInfo.duration || 'Unknown'}\n\nFormat your response as a detailed list with estimated timestamps and explanations covering the entire video. Include:\n- Introduction and setup (0:00 - ~2:00)\n- Main content sections with timestamps\n- Key points and highlights throughout\n- Conclusion and takeaways\n\nMake sure to cover the complete video duration, not just the first portion.` },
+      // Add all previous user/assistant messages
+      ...chatHistory,
+      { role: 'user', content: userInput }
+    ];
+    setChatHistory([...chatHistory, { role: 'user', content: userInput }]);
+    setUserInput('');
+    chrome.runtime.sendMessage({ type: 'GET_API_KEY' }, async (response) => {
+      const apiKey = response?.apiKey;
+      if (!apiKey) {
+        setIsAnalyzing(false);
+        setError('OpenAI API key not found. Please set it in the extension popup.');
+        return;
+      }
+      try {
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'HTTP-Referer': window.location.origin,
+            'X-Title': 'BreakDown AI Extension'
+          },
+          body: JSON.stringify({
+            model: 'openai/gpt-3.5-turbo',
+            messages: newHistory,
+            max_tokens: 1024,
+            temperature: 0.6
+          })
+        });
+        if (!response.ok) {
+          throw new Error(`OpenRouter API error: ${response.status}`);
+        }
+        const data = await response.json();
+        const aiText = data.choices?.[0]?.message?.content || 'No response from AI.';
+        setIsAnalyzing(false);
+        setChatHistory([...chatHistory, { role: 'user', content: userInput }, { role: 'assistant', content: aiText }]);
       } catch (err: any) {
         setIsAnalyzing(false);
         setError('Failed to get analysis from OpenAI. ' + (err?.message || ''));
@@ -114,8 +173,16 @@ Make sure to cover the complete video duration, not just the first portion.`;
 
   // Helper to parse timestamps and highlight them as clickable
   const seekToTimestamp = (timestamp: string) => {
-    const [min, sec] = timestamp.split(":").map(Number);
-    const seconds = min * 60 + sec;
+    // Support H:MM:SS and MM:SS
+    const parts = timestamp.split(":").map(Number);
+    let seconds = 0;
+    if (parts.length === 3) {
+      // H:MM:SS
+      seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    } else if (parts.length === 2) {
+      // MM:SS
+      seconds = parts[0] * 60 + parts[1];
+    }
     // Try to use the YouTube player API if available
     const video = document.querySelector('video');
     if (video) {
@@ -134,8 +201,8 @@ Make sure to cover the complete video duration, not just the first portion.`;
     return (
       <div>
         {lines.map((line, idx) => {
-          // Match timestamps like 1:23 or 12:34
-          const match = line.match(/(\d{1,2}:\d{2})/);
+          // Match timestamps like H:MM:SS or MM:SS
+          const match = line.match(/(\d{1,2}:\d{2}:\d{2}|\d{1,2}:\d{2})/);
           if (match) {
             const [timestamp] = match;
             const parts = line.split(timestamp);
@@ -163,6 +230,29 @@ Make sure to cover the complete video duration, not just the first portion.`;
       </div>
     );
   };
+
+  // Replace result rendering with chat rendering
+  const renderChat = () => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {chatHistory.map((msg, idx) => (
+        <div key={idx} style={{
+          alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
+          background: msg.role === 'user' ? '#f0f4ff' : '#f8f8fa',
+          color: '#222',
+          borderRadius: 10,
+          padding: '10px 14px',
+          maxWidth: '90%',
+          fontSize: 15.5,
+          boxShadow: msg.role === 'user' ? '0 2px 8px rgba(102,126,234,0.08)' : '0 2px 8px rgba(118,75,162,0.06)',
+          marginLeft: msg.role === 'user' ? 40 : 0,
+          marginRight: msg.role === 'user' ? 0 : 40,
+          whiteSpace: 'pre-line',
+        }}>
+          {msg.role === 'assistant' ? renderResult(msg.content) : msg.content}
+        </div>
+      ))}
+    </div>
+  );
 
   // Drag handlers
   const onHeaderMouseDown = (e: React.MouseEvent) => {
@@ -333,11 +423,60 @@ Make sure to cover the complete video duration, not just the first portion.`;
               flex: 1,
               overflowY: 'auto',
               maxHeight: modalSize.height - 56,
+              display: 'flex',
+              flexDirection: 'column',
             }}>
               <small style={{ color: '#888', fontSize: 12, display: 'block', marginBottom: 8 }}>Timestamps are estimates based on video description</small>
               {isAnalyzing && <div className="breakdown-ai-loading">Analyzing video... <span className="breakdown-ai-spinner"></span></div>}
               {error && <div style={{ color: 'red', marginTop: 12 }}>{error}</div>}
-              {result && <div className="breakdown-ai-results">{renderResult(result)}</div>}
+              {renderChat()}
+              {/* Chat input */}
+              <form
+                onSubmit={e => { e.preventDefault(); handleSendFollowup(); }}
+                style={{ display: 'flex', gap: 8, marginTop: 16, alignItems: 'center' }}
+              >
+                <input
+                  type="text"
+                  value={userInput}
+                  onChange={e => setUserInput(e.target.value)}
+                  placeholder="Ask for clarity or details..."
+                  style={{
+                    flex: 1,
+                    padding: '10px 14px',
+                    borderRadius: 8,
+                    border: '1.5px solid #d1d5db',
+                    fontSize: 15.5,
+                    outline: 'none',
+                  }}
+                  disabled={isAnalyzing}
+                  onKeyDown={e => {
+                    // Prevent YouTube shortcuts when typing in the input
+                    e.stopPropagation();
+                    // Do NOT call preventDefault, so keys are typed into the input
+                  }}
+                  onKeyUp={e => {
+                    // Prevent YouTube from seeing the keyup, but allow typing
+                    e.stopPropagation();
+                  }}
+                />
+                <button
+                  type="submit"
+                  disabled={isAnalyzing || !userInput.trim()}
+                  style={{
+                    background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: 8,
+                    padding: '10px 18px',
+                    fontWeight: 'bold',
+                    fontSize: 15.5,
+                    cursor: isAnalyzing || !userInput.trim() ? 'not-allowed' : 'pointer',
+                    opacity: isAnalyzing || !userInput.trim() ? 0.6 : 1,
+                  }}
+                >
+                  Send
+                </button>
+              </form>
             </div>
             {/* Resize handle */}
             <div
