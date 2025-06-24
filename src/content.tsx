@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import ReactDOM from 'react-dom/client';
 import './content.css';
 
@@ -18,6 +18,15 @@ const AnalysisOverlay: React.FC = () => {
   const [showModal, setShowModal] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Draggable modal state
+  const [modalPos, setModalPos] = useState<{ x: number; y: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const dragOffset = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const modalRef = useRef<HTMLDivElement>(null);
+  // Add modal size state
+  const [modalSize, setModalSize] = useState<{ width: number; height: number }>({ width: 400, height: 350 });
+  const resizing = useRef(false);
+  const resizeStart = useRef<{ x: number; y: number; width: number; height: number }>({ x: 0, y: 0, width: 400, height: 350 });
 
   const extractVideoInfo = (): VideoInfo => {
     const videoTitle = document.querySelector('h1.ytd-video-primary-info-renderer')?.textContent?.trim() || null;
@@ -37,9 +46,9 @@ const AnalysisOverlay: React.FC = () => {
     setResult(null);
     setError(null);
     const videoInfo = extractVideoInfo();
-    // Get OpenAI API key from chrome.storage
-    chrome.storage.sync.get(['openaiApiKey'], async (resultObj) => {
-      const apiKey = resultObj.openaiApiKey;
+    // Get OpenAI API key from background script
+    chrome.runtime.sendMessage({ type: 'GET_API_KEY' }, async (response) => {
+      const apiKey = response?.apiKey;
       if (!apiKey) {
         setIsAnalyzing(false);
         setError('OpenAI API key not found. Please set it in the extension popup.');
@@ -47,26 +56,43 @@ const AnalysisOverlay: React.FC = () => {
       }
       try {
         // Compose the prompt
-        const prompt = `You are an expert at summarizing YouTube videos. Given the following video information, provide a detailed breakdown with timestamps for important moments, key points, and a concise summary.\n\nTitle: ${videoInfo.title}\nDescription: ${videoInfo.description}\nChannel: ${videoInfo.channel}\nURL: ${videoInfo.url}\n\nFormat your response as a list with timestamps and explanations. If you do not know the timestamps, estimate them based on the description.`;
-        // Call OpenAI API
-        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        const prompt = `You are an expert at summarizing YouTube videos. Given the following video information, provide a comprehensive breakdown covering the ENTIRE video duration with estimated timestamps for important moments, key points, and a detailed summary.
+
+IMPORTANT: Provide timestamps and explanations for the FULL video duration, not just the beginning. Since you don't have access to the actual video content, estimate timestamps based on the description and typical video structure.
+
+Title: ${videoInfo.title}
+Description: ${videoInfo.description}
+Channel: ${videoInfo.channel}
+URL: ${videoInfo.url}
+
+Format your response as a detailed list with estimated timestamps and explanations covering the entire video. Include:
+- Introduction and setup (0:00 - ~2:00)
+- Main content sections with timestamps
+- Key points and highlights throughout
+- Conclusion and takeaways
+
+Make sure to cover the complete video duration, not just the first portion.`;
+        // Call OpenRouter API (which provides access to OpenAI models)
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
+            'Authorization': `Bearer ${apiKey}`,
+            'HTTP-Referer': window.location.origin,
+            'X-Title': 'BreakDown AI Extension'
           },
           body: JSON.stringify({
-            model: 'gpt-3.5-turbo',
+            model: 'openai/gpt-3.5-turbo',
             messages: [
-              { role: 'system', content: 'You are a helpful assistant that summarizes YouTube videos with timestamps and key points.' },
+              { role: 'system', content: 'You are a helpful assistant that provides comprehensive YouTube video summaries with estimated timestamps covering the ENTIRE video duration, not just the beginning portions.' },
               { role: 'user', content: prompt }
             ],
-            max_tokens: 700,
+            max_tokens: 1200,
             temperature: 0.6
           })
         });
         if (!response.ok) {
-          throw new Error(`OpenAI API error: ${response.status}`);
+          throw new Error(`OpenRouter API error: ${response.status}`);
         }
         const data = await response.json();
         const aiText = data.choices?.[0]?.message?.content || 'No response from AI.';
@@ -138,9 +164,77 @@ const AnalysisOverlay: React.FC = () => {
     );
   };
 
+  // Drag handlers
+  const onHeaderMouseDown = (e: React.MouseEvent) => {
+    if (modalRef.current) {
+      setDragging(true);
+      const rect = modalRef.current.getBoundingClientRect();
+      dragOffset.current = {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      };
+    }
+  };
+  React.useEffect(() => {
+    if (!dragging) return;
+    const onMouseMove = (e: MouseEvent) => {
+      // Clamp to viewport
+      const width = modalRef.current?.offsetWidth || 400;
+      const height = modalRef.current?.offsetHeight || 300;
+      const x = Math.max(0, Math.min(window.innerWidth - width, e.clientX - dragOffset.current.x));
+      const y = Math.max(0, Math.min(window.innerHeight - height, e.clientY - dragOffset.current.y));
+      setModalPos({ x, y });
+    };
+    const onMouseUp = () => setDragging(false);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, [dragging]);
+
+  // Resize handlers
+  const onResizeMouseDown = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    resizing.current = true;
+    resizeStart.current = {
+      x: e.clientX,
+      y: e.clientY,
+      width: modalSize.width,
+      height: modalSize.height,
+    };
+    document.body.style.userSelect = 'none';
+
+    // Attach listeners directly here
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const dx = moveEvent.clientX - resizeStart.current.x;
+      const dy = moveEvent.clientY - resizeStart.current.y;
+      setModalSize({
+        width: Math.max(320, resizeStart.current.width + dx),
+        height: Math.max(180, resizeStart.current.height + dy),
+      });
+    };
+    const onMouseUp = () => {
+      resizing.current = false;
+      document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  };
+
   return (
     <>
-      <div id="breakdown-ai-wrapper">
+      {/* Floating Analyze Button */}
+      <div id="breakdown-ai-wrapper" style={{
+        position: 'fixed',
+        bottom: 32,
+        right: 32,
+        zIndex: 999999,
+        pointerEvents: 'auto',
+      }}>
         <button
           onClick={handleAnalyze}
           disabled={isAnalyzing}
@@ -157,6 +251,7 @@ const AnalysisOverlay: React.FC = () => {
           )}
         </button>
       </div>
+      {/* Draggable Modal */}
       {showModal && (
         <div
           style={{
@@ -168,42 +263,102 @@ const AnalysisOverlay: React.FC = () => {
             zIndex: 1000000,
             background: 'rgba(0,0,0,0.18)',
             display: 'flex',
-            alignItems: 'flex-end',
-            justifyContent: 'flex-end',
+            alignItems: 'center',
+            justifyContent: 'center',
             pointerEvents: 'auto',
           }}
-          onClick={handleClose}
         >
           <div
+            ref={modalRef}
             style={{
               background: 'white',
-              borderRadius: 12,
-              boxShadow: '0 4px 32px rgba(0,0,0,0.18)',
-              padding: 24,
+              borderRadius: 16,
+              boxShadow: '0 8px 32px rgba(102,126,234,0.13), 0 2px 8px rgba(118,75,162,0.08)',
+              padding: 0,
               minWidth: 320,
-              maxWidth: 400,
+              maxWidth: 600,
+              width: modalSize.width,
+              minHeight: 180,
+              maxHeight: '80vh',
+              height: modalSize.height,
               color: '#222',
-              fontFamily: 'Roboto, sans-serif',
-              margin: '0 32px 90px 0',
-              position: 'relative',
+              fontFamily: 'Inter, Roboto, sans-serif',
+              margin: 0,
+              position: 'absolute',
+              left: modalPos ? modalPos.x : `calc(50vw - ${modalSize.width / 2}px)`,
+              top: modalPos ? modalPos.y : `calc(50vh - ${modalSize.height / 2}px)`,
               pointerEvents: 'auto',
+              overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+              transition: dragging ? 'none' : 'box-shadow 0.2s',
+              cursor: dragging ? 'grabbing' : 'default',
+              resize: 'none',
             }}
             onClick={e => e.stopPropagation()}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-              <h3 style={{ margin: 0, fontSize: 18, color: '#667eea' }}>AI Breakdown</h3>
+            <div style={{
+              background: 'linear-gradient(90deg, #667eea 0%, #764ba2 100%)',
+              borderTopLeftRadius: 16,
+              borderTopRightRadius: 16,
+              padding: '16px 24px 10px 24px',
+              display: 'flex',
+              flexDirection: 'row',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              position: 'relative',
+              cursor: 'grab',
+              userSelect: 'none',
+            }}
+            onMouseDown={onHeaderMouseDown}
+            >
+              <span style={{ fontFamily: 'inherit', fontSize: 19, color: 'white', fontWeight: 600, letterSpacing: 0.5 }}>AI Breakdown</span>
               <button
                 onClick={handleClose}
-                style={{ background: 'none', border: 'none', fontSize: 20, cursor: 'pointer', color: '#667eea', zIndex: 2 }}
+                style={{ background: 'none', border: 'none', fontSize: 24, cursor: 'pointer', color: '#fff', position: 'relative', zIndex: 2, lineHeight: 1 }}
                 aria-label="Close"
                 tabIndex={0}
               >
                 ×
               </button>
             </div>
-            {isAnalyzing && <div className="breakdown-ai-loading">Analyzing video... <span className="breakdown-ai-spinner"></span></div>}
-            {error && <div style={{ color: 'red', marginTop: 12 }}>{error}</div>}
-            {result && <div className="breakdown-ai-results">{renderResult(result)}</div>}
+            <div style={{
+              padding: '10px 24px 18px 24px',
+              background: 'white',
+              borderBottomLeftRadius: 16,
+              borderBottomRightRadius: 16,
+              lineHeight: 1.7,
+              fontSize: 15.5,
+              margin: 0,
+              flex: 1,
+              overflowY: 'auto',
+              maxHeight: modalSize.height - 56,
+            }}>
+              <small style={{ color: '#888', fontSize: 12, display: 'block', marginBottom: 8 }}>Timestamps are estimates based on video description</small>
+              {isAnalyzing && <div className="breakdown-ai-loading">Analyzing video... <span className="breakdown-ai-spinner"></span></div>}
+              {error && <div style={{ color: 'red', marginTop: 12 }}>{error}</div>}
+              {result && <div className="breakdown-ai-results">{renderResult(result)}</div>}
+            </div>
+            {/* Resize handle */}
+            <div
+              style={{
+                position: 'absolute',
+                right: 0,
+                bottom: 0,
+                width: 24,
+                height: 24,
+                cursor: 'nwse-resize',
+                zIndex: 10,
+                userSelect: 'none',
+                background: 'transparent',
+                display: 'flex',
+                alignItems: 'flex-end',
+                justifyContent: 'flex-end',
+              }}
+              onMouseDown={onResizeMouseDown}
+            >
+              <svg width="18" height="18" viewBox="0 0 18 18"><polyline points="4,18 18,4" stroke="#aaa" strokeWidth="2" fill="none"/></svg>
+            </div>
           </div>
         </div>
       )}
